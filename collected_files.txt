@@ -1,0 +1,1325 @@
+========================================
+FILE: src/main/java/com/hng/docxtractor/DocXtractorApplication.java
+========================================
+package com.hng.docxtractor;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class DocXtractorApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(DocXtractorApplication.class, args);
+    }
+
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/controller/DocumentController.java
+========================================
+package com.hng.docxtractor.controller;
+
+import com.hng.docxtractor.dto.DocumentAnalysisResponse;
+import com.hng.docxtractor.service.DocumentAnalysisService;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+@RestController
+@RequiredArgsConstructor
+@RequestMapping("/api/v1/documents")
+public class DocumentController {
+
+    private final DocumentAnalysisService documentAnalysisService;
+
+    @Operation(
+            summary = "Upload and analyze a document",
+            description = "Accepts PDF, DOCX, or image files and extracts text + detects images"
+    )
+    @PostMapping(
+            value = "/analyze",
+            consumes = MediaType.MULTIPART_FORM_DATA_VALUE
+    )
+    public ResponseEntity<DocumentAnalysisResponse> analyzeDocument(
+            @Parameter(description = "PDF, DOCX, JPG, PNG")
+            @RequestPart("file") MultipartFile file
+    ) {
+        DocumentAnalysisResponse response = documentAnalysisService.analyze(file);
+        return ResponseEntity.ok(response);
+    }
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/dto/DocumentAnalysisResponse.java
+========================================
+package com.hng.docxtractor.dto;
+
+import lombok.Builder;
+import lombok.Data;
+
+@Data
+@Builder
+public class DocumentAnalysisResponse {
+
+    private String fileName;
+    private String fileType;
+    private String contentType; // IMAGE_BASED, TEXT_BASED, MIXED_CONTENT
+
+    private String textExtracted;
+    private boolean containsImages;
+    private int imageCount;
+
+    private Summary summary;
+
+    // Add LLM analysis field
+    private LlmDocumentAnalysisResponse llmAnalysis;
+
+    @Data
+    @Builder
+    public static class Summary {
+        private boolean isBlank;
+        private boolean hasText;
+        private boolean hasImages;
+    }
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/dto/LlmDocumentAnalysisRequest.java
+========================================
+package com.hng.docxtractor.dto;
+
+import lombok.Builder;
+import lombok.Data;
+
+@Data
+@Builder
+public class LlmDocumentAnalysisRequest {
+    private String fileName;
+    private String extractedText;
+    private boolean hasImages;
+    private int imageCount;
+    private String fileType;
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/dto/LlmDocumentAnalysisResponse.java
+========================================
+package com.hng.docxtractor.dto;
+
+import lombok.Builder;
+import lombok.Data;
+
+@Data
+@Builder
+public class LlmDocumentAnalysisResponse {
+    private String documentType;
+    private String summary;
+    private Entities entities;
+
+    @Data
+    @Builder
+    public static class Entities {
+        private String[] names;
+        private String[] dates;
+        private String[] amounts;
+        private String[] emails;
+        private String[] phones;
+    }
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/service/impl/DocumentAnalysisServiceImpl.java
+========================================
+package com.hng.docxtractor.service.impl;
+
+import com.hng.docxtractor.dto.DocumentAnalysisResponse;
+import com.hng.docxtractor.dto.DocumentAnalysisResponse.Summary;
+import com.hng.docxtractor.dto.LlmDocumentAnalysisRequest;
+import com.hng.docxtractor.dto.LlmDocumentAnalysisResponse;
+import com.hng.docxtractor.ocr.OcrService;
+import com.hng.docxtractor.service.*;
+import lombok.RequiredArgsConstructor;
+import org.apache.tika.Tika;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.InputStream;
+
+@Service
+@RequiredArgsConstructor
+public class DocumentAnalysisServiceImpl implements DocumentAnalysisService {
+
+    private static final Logger log = LoggerFactory.getLogger(DocumentAnalysisServiceImpl.class);
+
+    private final PdfService pdfService;
+    private final DocxService docxService;
+    private final ImageService imageService;
+    private final OcrService ocrService;
+    private final Tika tika = new Tika();
+    private final LlmService llmService;
+    private LlmDocumentAnalysisResponse llmAnalysis;
+
+
+    private static final int TEXT_THRESHOLD = 20;
+
+    @Override
+    public DocumentAnalysisResponse analyze(MultipartFile file) {
+        try {
+            String originalFilename = file.getOriginalFilename();
+            if (originalFilename == null) originalFilename = "unknown";
+
+            String detectedContentType;
+            try (InputStream is = file.getInputStream()) {
+                detectedContentType = tika.detect(is, originalFilename);
+            }
+
+            DocumentAnalysisResponse.DocumentAnalysisResponseBuilder builder =
+                    DocumentAnalysisResponse.builder()
+                            .fileName(originalFilename)
+                            .fileType(detectedContentType);
+
+            String finalText = "";
+            boolean hasImages = false;
+            int imageCount = 0;
+
+            // IMAGE
+            if (detectedContentType != null && detectedContentType.startsWith("image/")) {
+                builder.contentType("IMAGE_BASED");
+                finalText = imageService.extractTextFromImage(file.getInputStream());
+                hasImages = true;
+                imageCount = 1;
+                builder.textExtracted(finalText == null ? "" : finalText)
+                        .containsImages(hasImages)
+                        .imageCount(imageCount)
+                        .summary(buildSummary(finalText, hasImages));
+            }
+            // PDF
+            else if (originalFilename.toLowerCase().endsWith(".pdf") || "application/pdf".equals(detectedContentType)) {
+                try (InputStream is1 = file.getInputStream(); InputStream is2 = file.getInputStream()) {
+                    String text = pdfService.extractText(is1);
+                    imageCount = pdfService.countImages(is2);
+                    hasImages = imageCount > 0;
+
+                    boolean textOk = text != null && text.trim().length() > TEXT_THRESHOLD;
+                    finalText = text == null ? "" : text;
+
+                    if (!textOk && hasImages) {
+                        try (InputStream is3 = file.getInputStream()) {
+                            String ocrText = pdfService.ocrPdfPages(is3);
+                            if (ocrText != null && !ocrText.isBlank()) {
+                                finalText = (finalText + "\n" + ocrText).trim();
+                            }
+                        }
+                    }
+
+                    String contentType = determineContentType(finalText, hasImages);
+                    builder.contentType(contentType)
+                            .textExtracted(finalText)
+                            .containsImages(hasImages)
+                            .imageCount(imageCount)
+                            .summary(buildSummary(finalText, hasImages));
+                }
+            }
+            // DOCX
+            else if (originalFilename.toLowerCase().endsWith(".docx") || detectedContentType.contains("officedocument")) {
+                try (InputStream is = file.getInputStream()) {
+                    String text = docxService.extractText(is);
+                    hasImages = docxService.hasImages(file.getInputStream());
+                    imageCount = hasImages ? docxService.countImages(file.getInputStream()) : 0;
+                    finalText = text == null ? "" : text;
+                    String contentType = determineContentType(finalText, hasImages);
+
+                    builder.contentType(contentType)
+                            .textExtracted(finalText)
+                            .containsImages(hasImages)
+                            .imageCount(imageCount)
+                            .summary(buildSummary(finalText, hasImages));
+                }
+            }
+            // fallback
+            else {
+                builder.contentType("UNKNOWN")
+                        .textExtracted("")
+                        .containsImages(false)
+                        .imageCount(0)
+                        .summary(buildSummary("", false));
+            }
+
+            // Call LLM after extraction
+            LlmDocumentAnalysisResponse llmResult = llmService.analyzeDocument(
+                    LlmDocumentAnalysisRequest.builder()
+                            .fileName(originalFilename)
+                            .fileType(detectedContentType)
+                            .extractedText(finalText)
+                            .hasImages(hasImages)
+                            .imageCount(imageCount)
+                            .build()
+            );
+            builder.llmAnalysis(llmResult);
+
+            return builder.build();
+
+        } catch (Exception ex) {
+            log.error("Failed to analyze file", ex);
+            throw new RuntimeException("Failed to analyze document: " + ex.getMessage(), ex);
+        }
+    }
+
+    private Summary buildSummary(String text, boolean hasImages) {
+        boolean hasText = text != null && text.trim().length() > TEXT_THRESHOLD;
+        boolean isBlank = !hasText && !hasImages;
+        return Summary.builder()
+                .isBlank(isBlank)
+                .hasText(hasText)
+                .hasImages(hasImages)
+                .build();
+    }
+
+    private String determineContentType(String text, boolean hasImages) {
+        boolean hasText = text != null && text.trim().length() > TEXT_THRESHOLD;
+        if (hasText && hasImages) return "MIXED_CONTENT";
+        if (hasText) return "TEXT_BASED";
+        if (hasImages) return "IMAGE_BASED";
+        return "UNKNOWN";
+    }
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/service/impl/PdfServiceImpl.java
+========================================
+package com.hng.docxtractor.service.impl;
+
+import com.hng.docxtractor.ocr.OcrService;
+import com.hng.docxtractor.service.PdfService;
+import lombok.RequiredArgsConstructor;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.rendering.ImageType;
+import org.apache.pdfbox.rendering.PDFRenderer;
+import org.apache.pdfbox.text.PDFTextStripper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+
+@Component
+@RequiredArgsConstructor
+public class PdfServiceImpl implements PdfService {
+
+    private static final Logger log = LoggerFactory.getLogger(PdfServiceImpl.class);
+    private final OcrService ocrService;
+
+    @Override
+    public String extractText(InputStream pdfStream) {
+        try (PDDocument document = PDDocument.load(pdfStream)) {
+            PDFTextStripper stripper = new PDFTextStripper();
+            String text = stripper.getText(document);
+            return text == null ? "" : text;
+        } catch (Exception e) {
+            log.warn("PDF text extraction failed: {}", e.getMessage());
+            return "";
+        }
+    }
+
+    @Override
+    public int countImages(InputStream pdfStream) {
+        try (PDDocument document = PDDocument.load(pdfStream)) {
+            PDFRenderer renderer = new PDFRenderer(document);
+            int count = 0;
+            for (int i = 0; i < document.getNumberOfPages(); i++) {
+                // Render very low DPI just to detect if page has any visible content (cheap heuristic)
+                BufferedImage bim = renderer.renderImageWithDPI(i, 16, ImageType.RGB);
+                if (bim != null) {
+                    // quick heuristic: check if image has more than just white pixels (approx)
+                    boolean nonBlank = hasNonWhitePixels(bim);
+                    if (nonBlank) count++;
+                }
+            }
+            return count;
+        } catch (Exception e) {
+            log.warn("PDF image count failed: {}", e.getMessage());
+            return 0;
+        }
+    }
+
+    @Override
+    public String ocrPdfPages(InputStream pdfStream) {
+        try (PDDocument document = PDDocument.load(pdfStream)) {
+            PDFRenderer renderer = new PDFRenderer(document);
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < document.getNumberOfPages(); i++) {
+                // 300 DPI recommended for OCR quality
+                BufferedImage bim = renderer.renderImageWithDPI(i, 300, ImageType.RGB);
+                if (bim == null) continue;
+
+                // Convert BufferedImage to InputStream for OCR service
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                ImageIO.write(bim, "PNG", baos);
+                try (ByteArrayInputStream bis = new ByteArrayInputStream(baos.toByteArray())) {
+                    String text = ocrService.doOcr(bis);
+                    if (text != null && !text.isBlank()) {
+                        sb.append(text).append("\n");
+                    }
+                }
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            log.warn("PDF OCR failed: {}", e.getMessage());
+            return "";
+        }
+    }
+
+    // cheap heuristic to check non-blank page
+    private boolean hasNonWhitePixels(BufferedImage img) {
+        int w = img.getWidth();
+        int h = img.getHeight();
+        int stepX = Math.max(1, w / 20);
+        int stepY = Math.max(1, h / 20);
+        for (int x = 0; x < w; x += stepX) {
+            for (int y = 0; y < h; y += stepY) {
+                int rgb = img.getRGB(x, y);
+                int r = (rgb >> 16) & 0xff;
+                int g = (rgb >> 8) & 0xff;
+                int b = rgb & 0xff;
+                if (!(r > 240 && g > 240 && b > 240)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/service/impl/DocxServiceImpl.java
+========================================
+package com.hng.docxtractor.service.impl;
+
+import com.hng.docxtractor.service.DocxService;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.poi.xwpf.extractor.XWPFWordExtractor;
+import org.apache.poi.xwpf.usermodel.XWPFPictureData;
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import org.springframework.stereotype.Component;
+
+import java.io.InputStream;
+import java.util.List;
+
+@Component
+@Slf4j
+public class DocxServiceImpl implements DocxService {
+
+    @Override
+    public String extractText(InputStream docxStream) {
+        try (XWPFDocument doc = new XWPFDocument(docxStream);
+             XWPFWordExtractor extractor = new XWPFWordExtractor(doc)) {
+            String text = extractor.getText();
+            return text == null ? "" : text;
+        } catch (Exception e) {
+            log.warn("DOCX extraction failed: {}", e.getMessage());
+            return "";
+        }
+    }
+
+    @Override
+    public boolean hasImages(InputStream docxStream) {
+        try (XWPFDocument doc = new XWPFDocument(docxStream)) {
+            List<XWPFPictureData> pics = doc.getAllPictures();
+            return pics != null && !pics.isEmpty();
+        } catch (Exception e) {
+            log.warn("DOCX hasImages check failed: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    @Override
+    public int countImages(InputStream docxStream) {
+        try (XWPFDocument doc = new XWPFDocument(docxStream)) {
+            List<XWPFPictureData> pics = doc.getAllPictures();
+            return pics == null ? 0 : pics.size();
+        } catch (Exception e) {
+            log.warn("DOCX countImages failed: {}", e.getMessage());
+            return 0;
+        }
+    }
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/service/impl/ImageServiceImpl.java
+========================================
+package com.hng.docxtractor.service.impl;
+
+import com.hng.docxtractor.ocr.OcrService;
+import com.hng.docxtractor.service.ImageService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+
+import java.io.InputStream;
+
+@Component
+@RequiredArgsConstructor
+public class ImageServiceImpl implements ImageService {
+
+    private final OcrService ocrService;
+
+    @Override
+    public String extractTextFromImage(InputStream imageStream) {
+        return ocrService.doOcr(imageStream);
+    }
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/service/impl/OpenRouterLlmServiceImpl.java
+========================================
+package com.hng.docxtractor.service.impl;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hng.docxtractor.dto.LlmDocumentAnalysisRequest;
+import com.hng.docxtractor.dto.LlmDocumentAnalysisResponse;
+import com.hng.docxtractor.service.LlmService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.*;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
+
+import java.util.Arrays;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class OpenRouterLlmServiceImpl implements LlmService {
+
+    private final RestTemplate restTemplate = new RestTemplate();
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Value("${openrouter.api-key}")
+    private String apiKey;
+
+    @Value("${openrouter.model}")
+    private String model;
+
+    private static final String OPENROUTER_URL = "https://api.openrouter.ai/v1/chat/completions";
+
+    @Override
+    public LlmDocumentAnalysisResponse analyzeDocument(LlmDocumentAnalysisRequest request) {
+        try {
+            String prompt = buildPrompt(request);
+
+            String bodyJson = "{\n" +
+                    "  \"model\": \"" + model + "\",\n" +
+                    "  \"messages\": [{\"role\": \"user\", \"content\": \"" + escapeJson(prompt) + "\"}]\n" +
+                    "}";
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            headers.setBearerAuth(apiKey);
+            HttpEntity<String> entity = new HttpEntity<>(bodyJson, headers);
+
+            ResponseEntity<String> response = restTemplate.exchange(
+                    OPENROUTER_URL, HttpMethod.POST, entity, String.class
+            );
+
+            if (response.getStatusCode() != HttpStatus.OK) {
+                log.warn("OpenRouter API returned status {}", response.getStatusCode());
+                return defaultResponse();
+            }
+
+            JsonNode root = objectMapper.readTree(response.getBody());
+            String text = root.path("choices").get(0).path("message").path("content").asText();
+
+            return parseLlmOutput(text);
+
+        } catch (Exception e) {
+            log.warn("LLM analysis failed: {}", e.getMessage());
+            return defaultResponse();
+        }
+    }
+
+    private String buildPrompt(LlmDocumentAnalysisRequest req) {
+        return """
+                You are a document analyzer. Given the extracted text and metadata below,
+                classify the document type (e.g., invoice, CV, report, letter),
+                provide a concise summary in 2-3 sentences,
+                and extract structured entities (names, dates, amounts, emails, phones).
+                Respond in JSON only with fields: documentType, summary, entities.
+
+                Metadata:
+                File Name: %s
+                File Type: %s
+                Has Images: %s
+                Image Count: %d
+
+                Extracted Text:
+                %s
+                """.formatted(
+                req.getFileName(),
+                req.getFileType(),
+                req.isHasImages(),
+                req.getImageCount(),
+                req.getExtractedText().replace("\"", "\\\"").replace("\n","\\n")
+        );
+    }
+
+    private String escapeJson(String input) {
+        return input.replace("\"", "\\\"").replace("\n", "\\n");
+    }
+
+    private LlmDocumentAnalysisResponse defaultResponse() {
+        return LlmDocumentAnalysisResponse.builder()
+                .documentType("unknown")
+                .summary("")
+                .entities(LlmDocumentAnalysisResponse.Entities.builder()
+                        .names(new String[]{})
+                        .dates(new String[]{})
+                        .amounts(new String[]{})
+                        .emails(new String[]{})
+                        .phones(new String[]{})
+                        .build())
+                .build();
+    }
+
+    private LlmDocumentAnalysisResponse parseLlmOutput(String jsonText) {
+        try {
+            JsonNode root = objectMapper.readTree(jsonText);
+            JsonNode entities = root.path("entities");
+            return LlmDocumentAnalysisResponse.builder()
+                    .documentType(root.path("documentType").asText())
+                    .summary(root.path("summary").asText())
+                    .entities(LlmDocumentAnalysisResponse.Entities.builder()
+                            .names(asStringArray(entities.path("names")))
+                            .dates(asStringArray(entities.path("dates")))
+                            .amounts(asStringArray(entities.path("amounts")))
+                            .emails(asStringArray(entities.path("emails")))
+                            .phones(asStringArray(entities.path("phones")))
+                            .build())
+                    .build();
+        } catch (Exception e) {
+            log.warn("Parsing LLM output failed: {}", e.getMessage());
+            return defaultResponse();
+        }
+    }
+
+    private String[] asStringArray(JsonNode node) {
+        if (node == null || !node.isArray()) return new String[]{};
+        return Arrays.stream(objectMapper.convertValue(node, String[].class)).toArray(String[]::new);
+    }
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/service/DocumentAnalysisService.java
+========================================
+package com.hng.docxtractor.service;
+
+import com.hng.docxtractor.dto.DocumentAnalysisResponse;
+import org.springframework.web.multipart.MultipartFile;
+
+public interface DocumentAnalysisService {
+    DocumentAnalysisResponse analyze(MultipartFile file);
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/service/PdfService.java
+========================================
+package com.hng.docxtractor.service;
+
+import java.io.InputStream;
+
+public interface PdfService {
+    /**
+     * Extract text from a PDF InputStream. Consumes the stream.
+     */
+    String extractText(InputStream pdfStream);
+
+    /**
+     * Count pages that contain images (approximation).
+     */
+    int countImages(InputStream pdfStream);
+
+    /**
+     * Render pages and run OCR; returns concatenated text results.
+     */
+    String ocrPdfPages(InputStream pdfStream);
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/service/DocxService.java
+========================================
+package com.hng.docxtractor.service;
+
+import java.io.InputStream;
+
+public interface DocxService {
+    /**
+     * Extract text from DOCX.
+     */
+    String extractText(InputStream docxStream);
+
+    /**
+     * Quick check if docx contains images.
+     */
+    boolean hasImages(InputStream docxStream);
+
+    /**
+     * Count images in docx (approx).
+     */
+    int countImages(InputStream docxStream);
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/service/ImageService.java
+========================================
+package com.hng.docxtractor.service;
+
+import java.io.InputStream;
+
+public interface ImageService {
+    /**
+     * Extract (OCR) text from an uploaded image InputStream.
+     */
+    String extractTextFromImage(InputStream imageStream);
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/service/LlmService.java
+========================================
+package com.hng.docxtractor.service;
+
+import com.hng.docxtractor.dto.LlmDocumentAnalysisRequest;
+import com.hng.docxtractor.dto.LlmDocumentAnalysisResponse;
+
+public interface LlmService {
+    LlmDocumentAnalysisResponse analyzeDocument(LlmDocumentAnalysisRequest request);
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/ocr/OcrService.java
+========================================
+package com.hng.docxtractor.ocr;
+
+import java.io.InputStream;
+
+/**
+ * Thin abstraction for OCR so we can swap implementations or mock in tests.
+ */
+public interface OcrService {
+    /**
+     * Perform OCR on the provided image InputStream. Returns empty string on failure/no text.
+     */
+    String doOcr(InputStream imageInputStream);
+}
+
+
+
+========================================
+FILE: src/main/java/com/hng/docxtractor/ocr/TesseractOcrService.java
+========================================
+package com.hng.docxtractor.ocr;
+
+import lombok.extern.slf4j.Slf4j;
+import net.sourceforge.tess4j.ITesseract;
+import net.sourceforge.tess4j.Tesseract;
+import net.sourceforge.tess4j.TesseractException;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import jakarta.annotation.PostConstruct;
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.InputStream;
+
+/**
+ * Tesseract-based OCR implementation. If Tess4J or native tessdata is missing,
+ * this will log warnings and return empty strings (so the whole pipeline still runs).
+ *
+ * Make sure to add Tess4J to your pom and set the tessdata path in application.yml:
+ * ocr.tessdata-path: /usr/share/tessdata
+ */
+@Component
+@Slf4j
+public class TesseractOcrService implements OcrService {
+
+    @Value("${ocr.tessdata-path:/usr/share/tessdata}")
+    private String tessDataPath;
+
+    @Value("${ocr.language:eng}")
+    private String language;
+
+    private ITesseract tesseract;
+    private boolean available = false;
+
+    @PostConstruct
+    public void init() {
+        try {
+            tesseract = new Tesseract();
+            tesseract.setDatapath(tessDataPath);
+            tesseract.setLanguage(language);
+            // quick test for availability would require an image; we only flag available=true
+            available = true;
+            log.info("Tesseract OCR configured with tessdata path: {}", tessDataPath);
+        } catch (Exception ex) {
+            available = false;
+            log.warn("Tesseract initialization failed - OCR disabled. {}", ex.getMessage());
+        }
+    }
+
+    @Override
+    public String doOcr(InputStream imageInputStream) {
+        if (!available) {
+            log.warn("OCR requested but Tesseract is not available. Returning empty result.");
+            return "";
+        }
+        try {
+            BufferedImage image = ImageIO.read(imageInputStream);
+            if (image == null) {
+                return "";
+            }
+            String result = tesseract.doOCR(image);
+            return result == null ? "" : result;
+        } catch (TesseractException te) {
+            log.warn("Tesseract OCR exception: {}", te.getMessage());
+            return "";
+        } catch (Exception e) {
+            log.warn("Generic OCR failure: {}", e.getMessage());
+            return "";
+        }
+    }
+}
+
+
+
+========================================
+FILE: src/test/java/com/hng/docxtractor/DocXtractorApplicationTests.java
+========================================
+package com.hng.docxtractor;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.context.SpringBootTest;
+
+@SpringBootTest
+class DocXtractorApplicationTests {
+
+    @Test
+    void contextLoads() {
+    }
+
+}
+
+
+
+========================================
+FILE: .idea/workspace.xml
+========================================
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="2c4deb3f-cba6-418c-a0f8-d0a4540ad018" name="Changes" comment="feat: create document analysis service and implementation">
+      <change afterPath="$PROJECT_DIR$/.gitattributes" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/dto/LlmDocumentAnalysisRequest.java" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/dto/LlmDocumentAnalysisResponse.java" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/ocr/OcrService.java" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/ocr/TesseractOcrService.java" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/service/DocxService.java" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/service/ImageService.java" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/service/LlmService.java" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/service/PdfService.java" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/service/impl/DocxServiceImpl.java" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/service/impl/ImageServiceImpl.java" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/service/impl/OpenRouterLlmServiceImpl.java" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/service/impl/PdfServiceImpl.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/pom.xml" beforeDir="false" afterPath="$PROJECT_DIR$/pom.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/dto/DocumentAnalysisResponse.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/dto/DocumentAnalysisResponse.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/service/impl/DocumentAnalysisServiceImpl.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/service/impl/DocumentAnalysisServiceImpl.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/resources/application.properties" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/resources/application.properties" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="FileTemplateManagerImpl">
+    <option name="RECENT_TEMPLATES">
+      <list>
+        <option value="Class" />
+      </list>
+    </option>
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="MacroExpansionManager">
+    <option name="directoryName" value="BZdpc1lw" />
+  </component>
+  <component name="MavenImportPreferences">
+    <option name="generalSettings">
+      <MavenGeneralSettings>
+        <option name="mavenHomeTypeForPersistence" value="WRAPPER" />
+      </MavenGeneralSettings>
+    </option>
+  </component>
+  <component name="ProjectColorInfo"><![CDATA[{
+  "associatedIndex": 7
+}]]></component>
+  <component name="ProjectId" id="36TKHq7x01wOmWuVboa7VMOnVa8" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "RequestMappingsPanelOrder0": "0",
+    "RequestMappingsPanelOrder1": "1",
+    "RequestMappingsPanelWidth0": "75",
+    "RequestMappingsPanelWidth1": "75",
+    "RunOnceActivity.ChatTagsLlmMigration": "true",
+    "RunOnceActivity.ClientConfigCleanupMigration": "true",
+    "RunOnceActivity.CodyAccountHistoryMigration": "true",
+    "RunOnceActivity.CodyAccountsIdsRefresh": "true",
+    "RunOnceActivity.CodyAssignOrphanedChatsToActiveAccount": "true",
+    "RunOnceActivity.CodyConvertUrlToCodebaseName": "true",
+    "RunOnceActivity.CodyHistoryLlmMigration": "true",
+    "RunOnceActivity.CodyMigrateChatHistory-v2": "true",
+    "RunOnceActivity.CodyProjectSettingsMigration": "true",
+    "RunOnceActivity.DeprecatedChatLlmMigration": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.ToggleCodyToolWindowAfterMigration": "true",
+    "Spring Boot.DocXtractorApplication.executor": "Run",
+    "git-widget-placeholder": "master",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "org.rust.cargo.project.model.impl.CargoExternalSystemProjectAware.subscribe.first.balloon": "",
+    "vue.rearranger.settings.migration": "true"
+  }
+}]]></component>
+  <component name="RecentsManager">
+    <key name="MoveClassesOrPackagesDialog.RECENTS_KEY">
+      <recent name="com.hng.docxtractor.service.impl" />
+    </key>
+  </component>
+  <component name="RunManager">
+    <configuration default="true" type="AZURE_FUNCTION_SUPPORT" factoryName="Run Functions">
+      <option name="appName" />
+      <option name="appServicePlanName" />
+      <option name="appServicePlanResourceGroup" />
+      <option name="appSettingsKey" value="efeb7525-484b-4688-a1f9-582e59e60e81" />
+      <option name="artifact" />
+      <option name="debugOptions" />
+      <option name="deployment" />
+      <option name="deploymentStagingDirectoryPath" />
+      <option name="funcPath" />
+      <option name="functionHostArguments" />
+      <option name="hostJsonPath" />
+      <option name="insightsName" />
+      <option name="instrumentationKey" />
+      <option name="javaVersion" />
+      <option name="localSettingsJsonPath" />
+      <option name="moduleName" />
+      <option name="os" />
+      <option name="pricingTier" />
+      <option name="providerMap">
+        <map />
+      </option>
+      <option name="region" />
+      <option name="resourceGroup" />
+      <option name="stagingFolder" />
+      <option name="subscription" />
+      <method v="2">
+        <option name="Make" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="DocXtractorApplication" type="SpringBootApplicationConfigurationType" factoryName="Spring Boot" nameIsGenerated="true">
+      <module name="DocXtractor" />
+      <option name="SPRING_BOOT_MAIN_CLASS" value="com.hng.docxtractor.DocXtractorApplication" />
+      <method v="2">
+        <option name="Make" enabled="true" />
+      </method>
+    </configuration>
+  </component>
+  <component name="SharedIndexes">
+    <attachedChunks>
+      <set>
+        <option value="bundled-jdk-9823dce3aa75-fbdcb00ec9e3-intellij.indexing.shared.core-IU-251.26094.121" />
+        <option value="bundled-js-predefined-d6986cc7102b-b26f3e71634d-JavaScript-IU-251.26094.121" />
+      </set>
+    </attachedChunks>
+  </component>
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="2c4deb3f-cba6-418c-a0f8-d0a4540ad018" name="Changes" comment="" />
+      <created>1765025039323</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1765025039323</updated>
+      <workItem from="1765025042008" duration="5341000" />
+    </task>
+    <task id="LOCAL-00001" summary="chore: initial commit">
+      <option name="closed" value="true" />
+      <created>1765026622070</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1765026622070</updated>
+    </task>
+    <task id="LOCAL-00002" summary="chore: create central controller">
+      <option name="closed" value="true" />
+      <created>1765026779522</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1765026779522</updated>
+    </task>
+    <task id="LOCAL-00003" summary="feat: create document analysis service and implementation">
+      <option name="closed" value="true" />
+      <created>1765026965143</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1765026965143</updated>
+    </task>
+    <option name="localTasksCounter" value="4" />
+    <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
+  <component name="Vcs.Log.Tabs.Properties">
+    <option name="TAB_STATES">
+      <map>
+        <entry key="MAIN">
+          <value>
+            <State />
+          </value>
+        </entry>
+      </map>
+    </option>
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="chore: initial commit" />
+    <MESSAGE value="chore: create central controller" />
+    <MESSAGE value="feat: create document analysis service and implementation" />
+    <option name="LAST_COMMIT_MESSAGE" value="feat: create document analysis service and implementation" />
+  </component>
+</project>
+
+
+========================================
+FILE: .idea/misc.xml
+========================================
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ExternalStorageConfigurationManager" enabled="true" />
+  <component name="MavenProjectsManager">
+    <option name="originalFiles">
+      <list>
+        <option value="$PROJECT_DIR$/pom.xml" />
+      </list>
+    </option>
+  </component>
+  <component name="ProjectRootManager" version="2" languageLevel="JDK_22" default="true" project-jdk-name="22" project-jdk-type="JavaSDK">
+    <output url="file://$PROJECT_DIR$/out" />
+  </component>
+</project>
+
+
+========================================
+FILE: .idea/vcs.xml
+========================================
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="$PROJECT_DIR$" vcs="Git" />
+  </component>
+</project>
+
+
+========================================
+FILE: .idea/compiler.xml
+========================================
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CompilerConfiguration">
+    <annotationProcessing>
+      <profile name="Annotation profile for DocXtractor" enabled="true">
+        <sourceOutputDir name="target/generated-sources/annotations" />
+        <sourceTestOutputDir name="target/generated-test-sources/test-annotations" />
+        <outputRelativeToContentRoot value="true" />
+        <processorPath useClasspath="false">
+          <entry name="$USER_HOME$/.m2/repository/org/projectlombok/lombok/1.18.42/lombok-1.18.42.jar" />
+        </processorPath>
+        <module name="DocXtractor" />
+      </profile>
+    </annotationProcessing>
+  </component>
+  <component name="JavacSettings">
+    <option name="ADDITIONAL_OPTIONS_OVERRIDE">
+      <module name="DocXtractor" options="-parameters" />
+    </option>
+  </component>
+</project>
+
+
+========================================
+FILE: .idea/encodings.xml
+========================================
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="Encoding">
+    <file url="file://$PROJECT_DIR$/src/main/java" charset="UTF-8" />
+  </component>
+</project>
+
+
+========================================
+FILE: .idea/jarRepositories.xml
+========================================
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="RemoteRepositoriesConfiguration">
+    <remote-repository>
+      <option name="id" value="central" />
+      <option name="name" value="Central Repository" />
+      <option name="url" value="https://repo.maven.apache.org/maven2" />
+    </remote-repository>
+    <remote-repository>
+      <option name="id" value="central" />
+      <option name="name" value="Maven Central repository" />
+      <option name="url" value="https://repo1.maven.org/maven2" />
+    </remote-repository>
+    <remote-repository>
+      <option name="id" value="jboss.community" />
+      <option name="name" value="JBoss Community repository" />
+      <option name="url" value="https://repository.jboss.org/nexus/content/repositories/public/" />
+    </remote-repository>
+  </component>
+</project>
+
+
+========================================
+FILE: .idea/easycode/codebase-v2.xml
+========================================
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="com.obiscr.chatgpt.settings.EasyCodeState">
+    <option name="projectFiles" value="$PROJECT_DIR$/src/main/java/com/hng/docxtractor/controller/DocumentController.java;/home/samael/Documents/DocXtractor/src/main/java/com/hng/docxtractor/dto/DocumentAnalysisResponse.java;/home/samael/Documents/DocXtractor/src/main/java/com/hng/docxtractor/ocr/OcrService.java;/home/samael/Documents/DocXtractor/src/main/java/com/hng/docxtractor/ocr/TesseractOcrService.java;/home/samael/Documents/DocXtractor/src/main/java/com/hng/docxtractor/service/impl/DocumentAnalysisServiceImpl.java;/home/samael/Documents/DocXtractor/src/main/java/com/hng/docxtractor/service/impl/DocxServiceImpl.java;/home/samael/Documents/DocXtractor/src/main/java/com/hng/docxtractor/service/impl/ImageServiceImpl.java;/home/samael/Documents/DocXtractor/src/main/java/com/hng/docxtractor/service/impl/PdfServiceImpl.java;/home/samael/Documents/DocXtractor/src/main/java/com/hng/docxtractor/service/DocumentAnalysisService.java;/home/samael/Documents/DocXtractor/src/main/java/com/hng/docxtractor/service/DocxService.java;/home/samael/Documents/DocXtractor/src/main/java/com/hng/docxtractor/service/ImageService.java;/home/samael/Documents/DocXtractor/src/main/java/com/hng/docxtractor/service/PdfService.java;/home/samael/Documents/DocXtractor/src/main/java/com/hng/docxtractor/DocXtractorApplication.java;/home/samael/Documents/DocXtractor/src/test/java/com/hng/docxtractor/DocXtractorApplicationTests.java" />
+  </component>
+</project>
+
+
+========================================
+FILE: pom.xml
+========================================
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.0.0</version>
+        <relativePath/> <!-- lookup parent from repository -->
+    </parent>
+    <groupId>com.hng</groupId>
+    <artifactId>DocXtractor</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>DocXtractor</name>
+    <description>DocXtractor</description>
+    <url/>
+    <licenses>
+        <license/>
+    </licenses>
+    <developers>
+        <developer/>
+    </developers>
+    <scm>
+        <connection/>
+        <developerConnection/>
+        <tag/>
+        <url/>
+    </scm>
+    <properties>
+        <java.version>21</java.version>
+    </properties>
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+
+        <!-- SPRINGDOC OpenAPI / Swagger UI -->
+        <!-- Add from start.spring.io -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>2.5.0</version>
+        </dependency>
+
+        <!-- APACHE TIKA -->
+        <!-- Add manually -->
+        <dependency>
+            <groupId>org.apache.tika</groupId>
+            <artifactId>tika-core</artifactId>
+            <version>2.9.1</version>
+        </dependency>
+
+        <dependency>
+            <groupId>net.sourceforge.tess4j</groupId>
+            <artifactId>tess4j</artifactId>
+            <version>5.4.0</version> <!-- or latest -->
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.tika</groupId>
+            <artifactId>tika-parsers-standard-package</artifactId>
+            <version>2.9.1</version>
+        </dependency>
+
+        <!-- APACHE POI for DOCX -->
+        <!-- Add manually -->
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml</artifactId>
+            <version>5.2.5</version>
+        </dependency>
+
+        <!-- PDFBOX -->
+        <!-- Add manually -->
+        <dependency>
+            <groupId>org.apache.pdfbox</groupId>
+            <artifactId>pdfbox</artifactId>
+            <version>2.0.30</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>
+
+
+
+========================================
+FILE: src/main/resources/application.properties
+========================================
+spring.application.name=DocXtractor
+openrouter.api-key=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
+openrouter.model=openai/gpt-4.1
+
+
+
+========================================
+FILE: .mvn/wrapper/maven-wrapper.properties
+========================================
+wrapperVersion=3.3.4
+distributionType=only-script
+distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.9.11/apache-maven-3.9.11-bin.zip
+
+
+
+========================================
+FILE: target/classes/application.properties
+========================================
+spring.application.name=DocXtractor
+openrouter.api-key=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
+openrouter.model=openai/gpt-4.1
+
+
+
