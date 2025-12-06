@@ -1,35 +1,46 @@
 package com.hng.docxtractor.controller;
 
-import com.hng.docxtractor.dto.DocumentAnalysisResponse;
-import com.hng.docxtractor.service.DocumentAnalysisService;
-import io.swagger.v3.oas.annotations.Operation;
-import io.swagger.v3.oas.annotations.Parameter;
+import com.hng.docxtractor.dto.*;
+import com.hng.docxtractor.service.DocumentService;
 import lombok.RequiredArgsConstructor;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
+import org.springframework.http.*;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 @RestController
-@RequiredArgsConstructor
 @RequestMapping("/api/v1/documents")
+@RequiredArgsConstructor
+@Validated
 public class DocumentController {
 
-    private final DocumentAnalysisService documentAnalysisService;
+    private final DocumentService documentService;
 
-    @Operation(
-            summary = "Upload and analyze a document",
-            description = "Accepts PDF, DOCX, or image files and extracts text + detects images"
-    )
-    @PostMapping(
-            value = "/analyze",
-            consumes = MediaType.MULTIPART_FORM_DATA_VALUE
-    )
-    public ResponseEntity<DocumentAnalysisResponse> analyzeDocument(
-            @Parameter(description = "PDF, DOCX, JPG, PNG")
-            @RequestPart("file") MultipartFile file
-    ) {
-        DocumentAnalysisResponse response = documentAnalysisService.analyze(file);
-        return ResponseEntity.ok(response);
+    /**
+     * Upload endpoint: POST /api/v1/documents/upload
+     * Accepts multipart/form-data "file"
+     */
+    @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<DocumentUploadResponse> upload(@RequestPart("file") MultipartFile file) {
+        DocumentUploadResponse res = documentService.uploadDocument(file);
+        return ResponseEntity.ok(res);
+    }
+
+    /**
+     * Analyze: POST /api/v1/documents/{id}/analyze
+     */
+    @PostMapping("/{id}/analyze")
+    public ResponseEntity<DocumentUploadResponse> analyze(@PathVariable("id") Long id) {
+        DocumentUploadResponse res = documentService.analyzeDocument(id);
+        return ResponseEntity.ok(res);
+    }
+
+    /**
+     * Get combined document
+     */
+    @GetMapping("/{id}")
+    public ResponseEntity<DocumentDetailsDto> get(@PathVariable("id") Long id) {
+        DocumentDetailsDto dto = documentService.getDocument(id);
+        return ResponseEntity.ok(dto);
     }
 }
