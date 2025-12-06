@@ -17,6 +17,9 @@ public class DocumentAnalysisResponse {
 
     private Summary summary;
 
+    // Add LLM analysis field
+    private LlmDocumentAnalysisResponse llmAnalysis;
+
     @Data
     @Builder
     public static class Summary {

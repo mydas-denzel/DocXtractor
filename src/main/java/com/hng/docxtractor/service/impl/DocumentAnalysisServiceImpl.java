@@ -2,11 +2,10 @@ package com.hng.docxtractor.service.impl;
 
 import com.hng.docxtractor.dto.DocumentAnalysisResponse;
 import com.hng.docxtractor.dto.DocumentAnalysisResponse.Summary;
+import com.hng.docxtractor.dto.LlmDocumentAnalysisRequest;
+import com.hng.docxtractor.dto.LlmDocumentAnalysisResponse;
 import com.hng.docxtractor.ocr.OcrService;
-import com.hng.docxtractor.service.DocxService;
-import com.hng.docxtractor.service.DocumentAnalysisService;
-import com.hng.docxtractor.service.ImageService;
-import com.hng.docxtractor.service.PdfService;
+import com.hng.docxtractor.service.*;
 import lombok.RequiredArgsConstructor;
 import org.apache.tika.Tika;
 import org.slf4j.Logger;
@@ -27,6 +26,9 @@ public class DocumentAnalysisServiceImpl implements DocumentAnalysisService {
     private final ImageService imageService;
     private final OcrService ocrService;
     private final Tika tika = new Tika();
+    private final LlmService llmService;
+    private LlmDocumentAnalysisResponse llmAnalysis;
+
 
     private static final int TEXT_THRESHOLD = 20;
 
@@ -46,30 +48,32 @@ public class DocumentAnalysisServiceImpl implements DocumentAnalysisService {
                             .fileName(originalFilename)
                             .fileType(detectedContentType);
 
-            // If file is an image (png/jpg/jpeg), OCR it and return
+            String finalText = "";
+            boolean hasImages = false;
+            int imageCount = 0;
+
+            // IMAGE
             if (detectedContentType != null && detectedContentType.startsWith("image/")) {
                 builder.contentType("IMAGE_BASED");
-                String ocr = imageService.extractTextFromImage(file.getInputStream());
-                int imageCount = 1;
-                builder.textExtracted(ocr == null ? "" : ocr)
-                        .containsImages(true)
+                finalText = imageService.extractTextFromImage(file.getInputStream());
+                hasImages = true;
+                imageCount = 1;
+                builder.textExtracted(finalText == null ? "" : finalText)
+                        .containsImages(hasImages)
                         .imageCount(imageCount)
-                        .summary(buildSummary(ocr, true));
-                return builder.build();
+                        .summary(buildSummary(finalText, hasImages));
             }
-
-            // PDF handling
-            if (originalFilename.toLowerCase().endsWith(".pdf") || "application/pdf".equals(detectedContentType)) {
+            // PDF
+            else if (originalFilename.toLowerCase().endsWith(".pdf") || "application/pdf".equals(detectedContentType)) {
                 try (InputStream is1 = file.getInputStream(); InputStream is2 = file.getInputStream()) {
                     String text = pdfService.extractText(is1);
-                    int imageCount = pdfService.countImages(is2);
-                    boolean hasImages = imageCount > 0;
+                    imageCount = pdfService.countImages(is2);
+                    hasImages = imageCount > 0;
 
                     boolean textOk = text != null && text.trim().length() > TEXT_THRESHOLD;
-                    String finalText = text == null ? "" : text;
+                    finalText = text == null ? "" : text;
 
                     if (!textOk && hasImages) {
-                        // run OCR on each page and append
                         try (InputStream is3 = file.getInputStream()) {
                             String ocrText = pdfService.ocrPdfPages(is3);
                             if (ocrText != null && !ocrText.isBlank()) {
@@ -84,32 +88,45 @@ public class DocumentAnalysisServiceImpl implements DocumentAnalysisService {
                             .containsImages(hasImages)
                             .imageCount(imageCount)
                             .summary(buildSummary(finalText, hasImages));
-                    return builder.build();
                 }
             }
-
-            // DOCX handling
-            if (originalFilename.toLowerCase().endsWith(".docx") || detectedContentType.contains("officedocument")) {
+            // DOCX
+            else if (originalFilename.toLowerCase().endsWith(".docx") || detectedContentType.contains("officedocument")) {
                 try (InputStream is = file.getInputStream()) {
                     String text = docxService.extractText(is);
-                    boolean hasImages = docxService.hasImages(file.getInputStream());
-                    boolean textOk = text != null && text.trim().length() > TEXT_THRESHOLD;
-                    String contentType = determineContentType(text, hasImages);
+                    hasImages = docxService.hasImages(file.getInputStream());
+                    imageCount = hasImages ? docxService.countImages(file.getInputStream()) : 0;
+                    finalText = text == null ? "" : text;
+                    String contentType = determineContentType(finalText, hasImages);
+
                     builder.contentType(contentType)
-                            .textExtracted(text == null ? "" : text)
+                            .textExtracted(finalText)
                             .containsImages(hasImages)
-                            .imageCount(hasImages ? docxService.countImages(file.getInputStream()) : 0)
-                            .summary(buildSummary(text, hasImages));
-                    return builder.build();
+                            .imageCount(imageCount)
+                            .summary(buildSummary(finalText, hasImages));
                 }
             }
+            // fallback
+            else {
+                builder.contentType("UNKNOWN")
+                        .textExtracted("")
+                        .containsImages(false)
+                        .imageCount(0)
+                        .summary(buildSummary("", false));
+            }
 
-            // fallback: unknown type
-            builder.contentType("UNKNOWN")
-                    .textExtracted("")
-                    .containsImages(false)
-                    .imageCount(0)
-                    .summary(buildSummary("", false));
+            // Call LLM after extraction
+            LlmDocumentAnalysisResponse llmResult = llmService.analyzeDocument(
+                    LlmDocumentAnalysisRequest.builder()
+                            .fileName(originalFilename)
+                            .fileType(detectedContentType)
+                            .extractedText(finalText)
+                            .hasImages(hasImages)
+                            .imageCount(imageCount)
+                            .build()
+            );
+            builder.llmAnalysis(llmResult);
+
             return builder.build();
 
         } catch (Exception ex) {
