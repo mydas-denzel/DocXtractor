@@ -20,13 +20,13 @@ public class OpenRouterLlmServiceImpl implements LlmService {
     private final RestTemplate restTemplate = new RestTemplate();
     private final ObjectMapper mapper = new ObjectMapper();
 
-    @Value("${openrouter.api-key:}")
+    @Value("${openrouter.api-key}")
     private String apiKey;
 
-    @Value("${openrouter.model:openai/gpt-4o-mini}")
+    @Value("${openrouter.model}")
     private String model;
 
-    @Value("${openrouter.url:https://api.openrouter.ai/v1/chat/completions}")
+    @Value("${openrouter.url}")
     private String openrouterUrl;
 
     @Override
@@ -44,24 +44,55 @@ public class OpenRouterLlmServiceImpl implements LlmService {
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
             if (apiKey != null && !apiKey.isBlank()) headers.setBearerAuth(apiKey);
+            // required by OpenRouter
+            headers.set("HTTP-Referer", "http://localhost");
+            headers.set("X-Title", "DocXtractor");
 
-            HttpEntity<String> entity = new HttpEntity<>(mapper.writeValueAsString(body), headers);
+            String bodyJson = mapper.writeValueAsString(body);
+            HttpEntity<String> entity = new HttpEntity<>(bodyJson, headers);
 
             ResponseEntity<String> resp = restTemplate.exchange(openrouterUrl, HttpMethod.POST, entity, String.class);
 
-            if (!resp.getStatusCode().is2xxSuccessful()) {
-                log.warn("OpenRouter non-2xx: {}", resp.getStatusCode());
-                return new LlmResult("unknown", "", "{}");
-            }
-            JsonNode root = mapper.readTree(resp.getBody());
-            // expected path: choices[0].message.content
-            String content = root.path("choices").path(0).path("message").path("content").asText();
-            if (content == null || content.isBlank()) {
-                log.warn("Empty LLM content");
+            // Log status & headers for debugging (important)
+            log.debug("OpenRouter response status: {}, headers: {}", resp.getStatusCode(), resp.getHeaders());
+
+            String respBody = resp.getBody();
+            if (respBody == null) {
+                log.warn("OpenRouter returned empty body (status {})", resp.getStatusCode());
                 return new LlmResult("unknown", "", "{}");
             }
 
-            // Try parse content as JSON
+            // If server returned non-2xx, log body and bail
+            if (!resp.getStatusCode().is2xxSuccessful()) {
+                log.warn("OpenRouter non-2xx {}: {}", resp.getStatusCode(), respBody);
+                // If the body looks like HTML, log an excerpt to help debugging
+                if (respBody.trim().startsWith("<")) {
+                    log.warn("OpenRouter returned HTML (likely an error page). First 500 chars:\n{}", respBody.length() > 500 ? respBody.substring(0,500) : respBody);
+                }
+                return new LlmResult("unknown", "", "{}");
+            }
+
+            // Defensive check: ensure Content-Type is JSON or body looks like JSON
+            MediaType ct = resp.getHeaders().getContentType();
+            boolean likelyJson = (ct != null && (ct.includes(MediaType.APPLICATION_JSON) || ct.getSubtype().contains("json")))
+                    || respBody.trim().startsWith("{")
+                    || respBody.trim().startsWith("[");
+
+            if (!likelyJson) {
+                log.warn("OpenRouter returned non-JSON response. Content-Type: {}, body-start: {}", ct, respBody.length()>100?respBody.substring(0,100):respBody);
+                return new LlmResult("unknown", "", "{}");
+            }
+
+            // Parse the actual response JSON
+            JsonNode root = mapper.readTree(respBody);
+            String content = root.path("choices").path(0).path("message").path("content").asText(null);
+
+            if (content == null || content.isBlank()) {
+                log.warn("Empty LLM content in JSON response; full resp: {}", respBody.length()>1000?respBody.substring(0,1000):respBody);
+                return new LlmResult("unknown", "", "{}");
+            }
+
+            // try parse LLM content (which should be JSON string)
             try {
                 JsonNode extracted = mapper.readTree(content);
                 String docType = extracted.path("documentType").asText("unknown");
@@ -70,19 +101,19 @@ public class OpenRouterLlmServiceImpl implements LlmService {
                 String entitiesJson = entities.isMissingNode() ? "{}" : mapper.writeValueAsString(entities);
                 return new LlmResult(docType, summary, entitiesJson);
             } catch (Exception e) {
-                // best-effort: attempt to extract json substring
+                log.warn("Failed to parse LLM content as JSON, returning raw content. parseErr={}", e.getMessage());
+                // best-effort: try to find JSON substring
                 int idx = content.indexOf('{');
                 if (idx >= 0) {
-                    String sub = content.substring(idx);
                     try {
-                        JsonNode extracted = mapper.readTree(sub);
+                        JsonNode extracted = mapper.readTree(content.substring(idx));
                         String docType = extracted.path("documentType").asText("unknown");
                         String summary = extracted.path("summary").asText("");
                         JsonNode entities = extracted.path("entities");
                         String entitiesJson = entities.isMissingNode() ? "{}" : mapper.writeValueAsString(entities);
                         return new LlmResult(docType, summary, entitiesJson);
                     } catch (Exception ex2) {
-                        log.warn("Failed to parse partial JSON from LLM: {}", ex2.getMessage());
+                        log.warn("Failed to parse partial JSON: {}", ex2.getMessage());
                         return new LlmResult("unknown", content, "{}");
                     }
                 } else {
@@ -91,7 +122,8 @@ public class OpenRouterLlmServiceImpl implements LlmService {
             }
 
         } catch (Exception e) {
-            log.warn("LLM call failed: {}", e.getMessage());
+            // Log full exception with stacktrace for diagnostics
+            log.warn("LLM call failed: {}", e.getMessage(), e);
             return new LlmResult("unknown", "", "{}");
         }
     }

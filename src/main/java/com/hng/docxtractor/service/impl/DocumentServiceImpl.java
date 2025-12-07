@@ -82,8 +82,20 @@ public class DocumentServiceImpl implements com.hng.docxtractor.service.Document
     @Override
     @Transactional
     public DocumentUploadResponse analyzeDocument(Long id) {
-        Document doc = docRepo.findById(id).orElseThrow(() -> new ApiException("Document not found: " + id));
-        if (doc.isAnalyzed()) {
+        Document doc = docRepo.findById(id)
+                .orElseThrow(() -> new ApiException("Document not found: " + id));
+
+        boolean hasValidSummary =
+                doc.getSummary() != null &&
+                        !doc.getSummary().trim().isEmpty();
+
+        boolean hasValidMetadata =
+                doc.getMetadataJson() != null &&
+                        !doc.getMetadataJson().trim().isEmpty() &&
+                        !doc.getMetadataJson().trim().equals("{}");
+
+        // ----- FIX: analyzed flag but missing data → re-analyze -----
+        if (doc.isAnalyzed() && hasValidSummary && hasValidMetadata) {
             return DocumentUploadResponse.builder()
                     .id(doc.getId())
                     .fileName(doc.getOriginalFileName())
@@ -95,11 +107,22 @@ public class DocumentServiceImpl implements com.hng.docxtractor.service.Document
                     .build();
         }
 
-        // call LLM
-        LlmService.LlmResult res = llmService.analyze(doc.getOriginalFileName(), doc.getContentType(),
-                doc.getExtractedText(), doc.isContainsImages(), doc.getImageCount());
+        // If analyzed == true but missing summary/metadata → log it and re-run LLM
+        if (doc.isAnalyzed() && (!hasValidSummary || !hasValidMetadata)) {
+            // You can log this if you want:
+            //log.warn("Document {} marked analyzed but missing summary or metadata, re-analyzing", id);
+        }
 
-        // save results
+        // ----- RUN LLM -----
+        LlmService.LlmResult res = llmService.analyze(
+                doc.getOriginalFileName(),
+                doc.getContentType(),
+                doc.getExtractedText(),
+                doc.isContainsImages(),
+                doc.getImageCount()
+        );
+
+        // ----- SAVE RESULTS -----
         doc.setDocumentType(res.documentType);
         doc.setSummary(res.summary);
         doc.setMetadataJson(res.entitiesJson);

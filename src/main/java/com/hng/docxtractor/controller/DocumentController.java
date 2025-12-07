@@ -9,7 +9,7 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 @RestController
-@RequestMapping("/api/v1/documents")
+@RequestMapping("/documents")
 @RequiredArgsConstructor
 @Validated
 public class DocumentController {
@@ -17,7 +17,7 @@ public class DocumentController {
     private final DocumentService documentService;
 
     /**
-     * Upload endpoint: POST /api/v1/documents/upload
+     * Upload endpoint: POST /upload
      * Accepts multipart/form-data "file"
      */
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -27,7 +27,7 @@ public class DocumentController {
     }
 
     /**
-     * Analyze: POST /api/v1/documents/{id}/analyze
+     * Analyze: POST /documents/{id}/analyze
      */
     @PostMapping("/{id}/analyze")
     public ResponseEntity<DocumentUploadResponse> analyze(@PathVariable("id") Long id) {
