@@ -23,11 +23,13 @@ public class Document {
     private String extractedText;
 
     private boolean containsImages;
+
     private int imageCount;
 
     private boolean analyzed;
 
     private String documentType; // invoice, cv, report, etc.
+
     @Lob
     private String summary;
 
