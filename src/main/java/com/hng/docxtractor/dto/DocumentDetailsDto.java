@@ -1,9 +1,11 @@
 package com.hng.docxtractor.dto;
 import lombok.*;
 
+import java.util.UUID;
+
 @Data @Builder
 public class DocumentDetailsDto {
-    private Long id;
+    private UUID id;
     private String fileName;
     private String contentType;
     private Long sizeBytes;

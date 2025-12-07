@@ -1,8 +1,10 @@
-package com.hng.docxtractor.repository;
+package com.hng.docxtractor.repo;
 
 import com.hng.docxtractor.entity.Document;
 import org.springframework.data.jpa.repository.JpaRepository;
 
-public interface DocumentRepository extends JpaRepository<Document, Long> {
+import java.util.UUID;
+
+public interface DocumentRepository extends JpaRepository<Document, UUID> {
 
 }
