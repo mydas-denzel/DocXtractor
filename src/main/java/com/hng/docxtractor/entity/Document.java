@@ -10,7 +10,8 @@ import java.time.Instant;
 @Table(name = "documents")
 @Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
 public class Document {
-    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
     private String originalFileName;
@@ -19,7 +20,6 @@ public class Document {
     private Long sizeBytes;
 
     @Lob
-    @Column(columnDefinition = "TEXT")
     private String extractedText;
 
     private boolean containsImages;
@@ -29,14 +29,12 @@ public class Document {
 
     private String documentType; // invoice, cv, report, etc.
     @Lob
-    @Column(columnDefinition = "TEXT")
     private String summary;
 
     /**
      * JSON string containing extracted structured metadata (names, dates, amounts, emails, phones)
      */
     @Lob
-    @Column(columnDefinition = "TEXT")
     private String metadataJson;
 
     @CreationTimestamp
