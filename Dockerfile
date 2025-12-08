@@ -1,22 +1,20 @@
-FROM eclipse-temurin:21-jre-alpine AS build
+# ====== Build Stage ======
+FROM maven:3.9.9-eclipse-temurin-21 AS build
 WORKDIR /app
 
+COPY pom.xml .
 COPY mvnw .
 COPY .mvn .mvn
-COPY pom.xml .
-RUN ./mvnw dependency:go-offline
-
 COPY src ./src
+
+RUN ./mvnw dependency:go-offline
 RUN ./mvnw -DskipTests package
 
-# ---------------------------
-# Runtime stage
-# ---------------------------
-FROM eclipse-temurin:21-jre
 
-WORKDIR /app
+# ====== Runtime Stage ======
+FROM eclipse-temurin:21-jre   #JRE is OK here (NOT alpine)
 
-# install tesseract + language packs
+# Install Tesseract OCR
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-eng \
@@ -24,9 +22,8 @@ RUN apt-get update && apt-get install -y \
     libleptonica-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
-
-ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata/
 
 EXPOSE 8080
 ENTRYPOINT ["java", "-jar", "app.jar"]
