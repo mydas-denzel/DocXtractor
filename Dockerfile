@@ -1,4 +1,5 @@
-FROM openjdk:21-slim AS build
+FROM eclipse-temurin:21-jre-alpine
+AS build
 WORKDIR /app
 
 COPY mvnw .
@@ -12,7 +13,8 @@ RUN ./mvnw -DskipTests package
 # ---------------------------
 # Runtime stage
 # ---------------------------
-FROM openjdk:21-slim
+FROM eclipse-temurin:21-jre-alpine
+
 WORKDIR /app
 
 # install tesseract + language packs
