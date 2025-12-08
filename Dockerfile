@@ -12,7 +12,7 @@ RUN ./mvnw -DskipTests package
 # ---------------------------
 # Runtime stage
 # ---------------------------
-FROM eclipse-temurin:21-jre-alpine
+FROM eclipse-temurin:21-jre
 
 WORKDIR /app
 
