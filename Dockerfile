@@ -12,7 +12,7 @@ RUN ./mvnw -DskipTests package
 
 
 # ====== Runtime Stage ======
-FROM eclipse-temurin:21-jre   #JRE is OK here (NOT alpine)
+FROM eclipse-temurin:21-jre
 
 # Install Tesseract OCR
 RUN apt-get update && apt-get install -y \
